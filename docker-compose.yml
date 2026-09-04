@@ -1,0 +1,103 @@
+# ───────────────────────────────────────────────────────────
+# DNS Zone Manager — Full Mode (PostgreSQL, 3 containers)
+# For production / multi-user / high-volume deployments
+# ───────────────────────────────────────────────────────────
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: dns-frontend
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - dns_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dns-backend
+    env_file:
+      - .env
+    environment:
+      - USE_SQLITE=false
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-dns_admin}:${POSTGRES_PASSWORD:-ChangeMe123!}@postgres:5432/${POSTGRES_DB:-dns_manager}
+      - JWT_SECRET=${JWT_SECRET:-change-this-to-a-random-secret-key}
+      - JWT_ALGORITHM=HS256
+      - JWT_EXPIRE_MINUTES=480
+      - F5_ACTIVE_HOST=${F5_ACTIVE_HOST}
+      - F5_SSH_PORT=${F5_SSH_PORT:-22}
+      - F5_SSH_USER=${F5_SSH_USER:-root}
+      - F5_SSH_PASSWORD=${F5_SSH_PASSWORD:-}
+      - F5_SSH_KEY_PATH=${F5_SSH_KEY_PATH:-/app/keys/id_ed25519}
+      - F5_SSH_KEY_PASSPHRASE=${F5_SSH_KEY_PASSPHRASE:-}
+      - F5_NAMED_CONF=${F5_NAMED_CONF:-/var/named/config/named.conf}
+      - F5_ZONE_DIR=${F5_ZONE_DIR:-/var/named/config/namedb}
+      - DEBUG=${DEBUG:-false}
+    volumes:
+      - ./ssh_keys:/app/keys:ro
+      - ./backups:/app/backups
+      - backend_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - dns_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: dns-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dns_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ChangeMe123!}
+      POSTGRES_DB: ${POSTGRES_DB:-dns_manager}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - dns_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dns_admin} -d ${POSTGRES_DB:-dns_manager}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pg_data:
+  backend_logs:
+
+networks:
+  dns_net:
+    driver: bridge

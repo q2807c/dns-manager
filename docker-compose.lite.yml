@@ -1,0 +1,75 @@
+# ───────────────────────────────────────────────────────────
+# DNS Zone Manager — Lite Mode (SQLite, 2 containers)
+# Ideal for quick deployment, testing, and small teams
+# ───────────────────────────────────────────────────────────
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: dns-frontend
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - dns_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dns-backend
+    environment:
+      - USE_SQLITE=true
+      - SQLITE_DB_PATH=/app/data/dns_manager.db
+      - JWT_SECRET=${JWT_SECRET:-change-this-to-a-random-secret-key}
+      - JWT_ALGORITHM=HS256
+      - JWT_EXPIRE_MINUTES=480
+      - F5_ACTIVE_HOST=${F5_ACTIVE_HOST:-172.18.1.202}
+      - F5_SSH_PORT=${F5_SSH_PORT:-22}
+      - F5_SSH_USER=${F5_SSH_USER:-root}
+      - F5_SSH_PASSWORD=${F5_SSH_PASSWORD:-}
+      - F5_SSH_KEY_PATH=${F5_SSH_KEY_PATH:-/app/keys/id_ed25519}
+      - F5_SSH_KEY_PASSPHRASE=${F5_SSH_KEY_PASSPHRASE:-}
+      - F5_NAMED_CONF=${F5_NAMED_CONF:-/var/named/config/named.conf}
+      - F5_ZONE_DIR=${F5_ZONE_DIR:-/var/named/config/namedb}
+      - DEBUG=${DEBUG:-false}
+    volumes:
+      - db_data:/app/data
+      - ./ssh_keys:/app/keys:ro
+      - ./backups:/app/backups
+      - backend_logs:/app/logs
+    networks:
+      - dns_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  db_data:
+  backend_logs:
+
+networks:
+  dns_net:
+    driver: bridge

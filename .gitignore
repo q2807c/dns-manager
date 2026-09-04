@@ -1,0 +1,109 @@
+# ════════════════════════════════════════════════════════════════
+# DNS Zone Manager — .gitignore
+# ════════════════════════════════════════════════════════════════
+
+# ── Node / Frontend ──
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+frontend/.env.local
+frontend/.env.*.local
+frontend/npm-debug.log*
+frontend/yarn-error.log
+frontend/pnpm-debug.log*
+frontend/.pnpm-store/
+frontend/coverage/
+
+# ── Python / Backend ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+backend/.venv/
+
+# ── Database & runtime data ──
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+backend/*.db
+backend/*.db-*
+backend/dns_manager.db*
+
+# ── Environment & secrets (NEVER commit) ──
+.env
+.env.*
+!.env.example
+nginx/certs/*.crt
+nginx/certs/*.key
+nginx/certs/*.pem
+nginx/certs/*.csr
+ssh_keys/
+*.key
+*.pem
+*.pfx
+
+# ── Logs & backups ──
+log/
+logs/
+*.log
+backups/
+*.tar.gz
+*.zip
+release/
+
+# ── IDE & OS ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── WorkBuddy local cache (NOT a temp dir, but per-project only) ──
+.workbuddy/
+
+# ── Build artifacts ──
+build/
+dist/
+out/
+*.tsbuildinfo
+.cache/
+
+# ── Test artifacts ──
+.coverage
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+.playwright/
+
+# ── Docker local volumes (in case bind-mounted inside repo) ──
+docker-data/
+.docker/
+
+# ── Misc ──
+*.bak
+*.tmp
+*.orig
+*.rej
+.versions
+.turbo/
