@@ -5,6 +5,7 @@
 
 services:
   frontend:
+    image: q2807c/dns-manager-frontend:v1.0.0
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -27,6 +28,7 @@ services:
         max-file: "3"
 
   backend:
+    image: q2807c/dns-manager-backend:v1.0.0
     build:
       context: ./backend
       dockerfile: Dockerfile

@@ -94,11 +94,17 @@
 # 创建工作目录
 mkdir -p /opt/dns-manager && cd /opt/dns-manager
 
-# 二选一
+# 三选一
 # A.1 从源码部署（开发 / 内部使用）
-git clone https://github.com/<owner>/dns-manager.git .
+git clone https://github.com/q2807c/dns-manager.git .
 # A.2 从离线包部署（交付场景，跳过本步）
 #    tar xzf dns-manager-v1.0.0-offline.tar.gz --strip-components=1
+# A.3 拉取预构建镜像（生产推荐，只需 compose 文件与配置）
+curl -O https://raw.githubusercontent.com/q2807c/dns-manager/v1.0.0/docker-compose.lite.yml
+curl -O https://raw.githubusercontent.com/q2807c/dns-manager/v1.0.0/docker-compose.yml
+curl -O https://raw.githubusercontent.com/q2807c/dns-manager/v1.0.0/.env.example
+curl -O https://raw.githubusercontent.com/q2807c/dns-manager/v1.0.0/generate-certs.sh
+chmod +x generate-certs.sh
 ```
 
 ### 3.2 配置环境变量
@@ -157,8 +163,14 @@ sudo chown -R $USER:$USER nginx/certs/
 ### 3.5 启动
 
 ```bash
-# 构建并后台启动
+# 方式 ①：从源码构建（A.1，需源码目录）
 docker compose -f docker-compose.lite.yml up -d --build
+
+# 方式 ②：使用预构建镜像（A.2 / A.3，无需源码，国内可先配置镜像加速）
+docker pull q2807c/dns-manager-backend:v1.0.0
+docker pull q2807c/dns-manager-frontend:v1.0.0
+docker compose -f docker-compose.lite.yml up -d
+#   compose 中已声明 image: q2807c/dns-manager-*:v1.0.0，pull 后直接复用，不会重复构建
 
 # 查看状态
 docker compose -f docker-compose.lite.yml ps
@@ -446,8 +458,8 @@ gunzip -c backups/db-20260904.sql.gz | docker compose exec -T postgres psql -U d
 # 2. 拉取新镜像（或拉新代码）
 git pull origin main
 # 或
-docker pull <owner>/dns-manager-backend:v1.1.0
-docker pull <owner>/dns-manager-frontend:v1.1.0
+docker pull q2807c/dns-manager-backend:v1.1.0
+docker pull q2807c/dns-manager-frontend:v1.1.0
 
 # 3. 滚动升级（先 backend，再 frontend）
 docker compose -f docker-compose.lite.yml up -d --no-deps backend
@@ -462,8 +474,8 @@ curl -sk https://localhost/api/health
 
 ```bash
 # 把镜像 tag 切回上一个版本
-docker tag <owner>/dns-manager-backend:v1.0.0 dns-manager-backend:latest
-docker tag <owner>/dns-manager-frontend:v1.0.0 dns-manager-frontend:latest
+docker tag q2807c/dns-manager-backend:v1.0.0 dns-manager-backend:latest
+docker tag q2807c/dns-manager-frontend:v1.0.0 dns-manager-frontend:latest
 docker compose -f docker-compose.lite.yml up -d
 ```
 

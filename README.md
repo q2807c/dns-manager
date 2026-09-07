@@ -5,6 +5,8 @@
 [![Backend](https://img.shields.io/badge/backend-FastAPI-009688)](https://fastapi.tiangolo.com/)
 [![Frontend](https://img.shields.io/badge/frontend-Vue3%20%2B%20TypeScript-42b883)](https://vuejs.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ed)](https://www.docker.com/)
+[![Docker Pulls](https://img.shields.io/docker/pulls/q2807c/dns-manager-backend?label=backend%20pulls)](https://hub.docker.com/r/q2807c/dns-manager-backend)
+[![Docker Pulls](https://img.shields.io/docker/pulls/q2807c/dns-manager-frontend?label=frontend%20pulls)](https://hub.docker.com/r/q2807c/dns-manager-frontend)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 ---
@@ -24,9 +26,34 @@
 
 ## 📦 快速开始（5 分钟跑起来）
 
+### 方式一：拉取预构建镜像（推荐，无需源码）
+
+```bash
+# 1. 准备环境变量（生成强随机 JWT 密钥）
+cp .env.example .env
+sed -i.bak "s|^JWT_SECRET=.*|JWT_SECRET=$(openssl rand -hex 32)|" .env
+
+# 2. 生成自签名证书（替换 your-server-ip 为实际域名或 IP）
+./generate-certs.sh your-server-ip
+
+# 3. 拉镜像并启动（Lite 模式：SQLite + 单机双容器）
+docker pull q2807c/dns-manager-backend:v1.0.0
+docker pull q2807c/dns-manager-frontend:v1.0.0
+docker compose -f docker-compose.lite.yml up -d
+
+# 4. 访问
+open https://your-server-ip/
+# 默认账号: admin / admin123  (⚠️ 首次登录后立即修改)
+```
+
+> 预构建镜像为 **linux/amd64**（对应生产服务器主流架构）。离线环境可下载 Release 中的
+> `dns-manager-images-v1.0.0.tar`，用 `docker load -i` 导入。
+
+### 方式二：从源码构建
+
 ```bash
 # 1. 克隆代码
-git clone https://github.com/<owner>/dns-manager.git
+git clone https://github.com/q2807c/dns-manager.git
 cd dns-manager
 
 # 2. 准备环境变量（生成强随机 JWT 密钥）
@@ -36,8 +63,8 @@ sed -i.bak "s|^JWT_SECRET=.*|JWT_SECRET=$(openssl rand -hex 32)|" .env
 # 3. 生成自签名证书（替换 example.com 为实际域名或 IP）
 ./generate-certs.sh your-server-ip-or-domain
 
-# 4. 启动（Lite 模式：SQLite + 单机双容器）
-docker compose -f docker-compose.lite.yml up -d
+# 4. 构建并启动（Lite 模式：SQLite + 单机双容器）
+docker compose -f docker-compose.lite.yml up -d --build
 
 # 5. 访问
 open https://your-server-ip/
