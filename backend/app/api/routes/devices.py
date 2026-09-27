@@ -12,7 +12,7 @@ from app.schemas import (
     F5DeviceCreate, F5DeviceUpdate, F5DeviceResponse, F5DeviceListResponse,
 )
 from app.core.auth import get_current_user, require_permission
-from app.services.ssh_connector import ssh_connector
+from app.services.ssh_connector import ssh_connector, run_ssh
 
 logger = logging.getLogger(__name__)
 
@@ -250,14 +250,28 @@ async def test_device_connection(
         raise HTTPException(status_code=404, detail="Device not found")
 
     try:
-        # Register temporarily and test
+        # Register temporarily and test (SSH work must run off the event
+        # loop — a hanging connect otherwise stalls every other endpoint)
         ssh_connector.register_device(device.id, _device_config_from_model(device))
-        exit_code, stdout, stderr = ssh_connector.exec_command(
-            "echo OK && hostname", device_id=device.id,
+        exit_code, stdout, stderr = await run_ssh(
+            ssh_connector.exec_command, "echo OK && hostname", device_id=device.id,
         )
         ssh_connector.unregister_device(device.id)
+        if exit_code == 0:
+            return {
+                "status": "success",
+                "hostname": stdout.strip(),
+                "stderr": stderr.strip(),
+            }
+        # SSH connected but the command failed (non-zero exit or closed
+        # channel returning -1, e.g. tmsh/restricted shell on F5).
+        # Always include an `error` field so the UI shows a real message
+        # instead of falling back to "未知错误".
         return {
-            "status": "success" if exit_code == 0 else "failed",
+            "status": "failed",
+            "error": (
+                f"SSH 已连接，但命令执行失败（exit={exit_code}）: {stderr.strip() or '无 stderr 输出（常见于 F5 tmsh 受限 shell，请将设备账号 shell 设为 bash）'}"
+            ),
             "hostname": stdout.strip(),
             "stderr": stderr.strip(),
         }

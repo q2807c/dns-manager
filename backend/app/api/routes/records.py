@@ -15,7 +15,7 @@ from app.schemas import (
 )
 from app.core.auth import get_current_user, require_permission
 from app.core.rbac import has_permission_for_zone
-from app.services.ssh_connector import ssh_connector
+from app.services.ssh_connector import ssh_connector, run_ssh
 from app.services.zone_parser import (
     parse_zone_text, extract_records, get_zone_serial,
     validate_zone_syntax, increment_serial, serialize_zone,
@@ -54,7 +54,7 @@ async def list_records(
     zone = await _get_zone(db, zone_name)
 
     try:
-        content = ssh_connector.read_zone(zone_name, device_id=zone.device_id)
+        content = await run_ssh(ssh_connector.read_zone,zone_name, device_id=zone.device_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SSH read failed: {e}")
 
@@ -93,7 +93,7 @@ async def list_records(
 async def _begin_edit(zone_name: str, user: User, db: AsyncSession, device_id: Optional[int] = None):
     """Begin zone edit: sync journal, backup, read content, bump serial."""
     try:
-        content, backup = ssh_connector.begin_zone_edit(zone_name, device_id=device_id)
+        content, backup = await run_ssh(ssh_connector.begin_zone_edit,zone_name, device_id=device_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to begin zone edit: {e}")
 
@@ -110,17 +110,17 @@ async def _begin_edit(zone_name: str, user: User, db: AsyncSession, device_id: O
     return content, backup, new_serial
 
 
-def _commit_edit(zone_name: str, backup: str, new_content: str, device_id: Optional[int] = None):
+async def _commit_edit(zone_name: str, backup: str, new_content: str, device_id: Optional[int] = None):
     """Commit zone edit: write, reload, verify. Rollback on failure."""
     try:
-        exit_code, out, err = ssh_connector.end_zone_edit(
+        exit_code, out, err = await run_ssh(ssh_connector.end_zone_edit,
             zone_name, new_content, device_id=device_id,
         )
         if exit_code != 0:
             raise Exception(f"rndc reload failed: {err}")
     except Exception as e:
         try:
-            ssh_connector.rollback_zone_edit(zone_name, backup, device_id=device_id)
+            await run_ssh(ssh_connector.rollback_zone_edit,zone_name, backup, device_id=device_id)
         except Exception as rollback_err:
             logger.error(f"Rollback also failed: {rollback_err}")
         raise HTTPException(status_code=500, detail=f"Zone edit failed: {e}")
@@ -157,7 +157,7 @@ async def create_record(
     if not is_valid:
         raise HTTPException(status_code=400, detail=f"Invalid record: {'; '.join(errors)}")
 
-    _commit_edit(zone_name, backup, new_content, device_id=device_id)
+    await _commit_edit(zone_name, backup, new_content, device_id=device_id)
 
     # Audit
     db.add(AuditLog(
@@ -225,7 +225,7 @@ async def update_record(
     if not is_valid:
         raise HTTPException(status_code=400, detail=f"Invalid zone: {'; '.join(errors)}")
 
-    _commit_edit(zone_name, backup, new_content, device_id=device_id)
+    await _commit_edit(zone_name, backup, new_content, device_id=device_id)
 
     # Audit
     db.add(AuditLog(
@@ -278,7 +278,7 @@ async def delete_record(
     new_content = content.replace(old_line + "\n", "").replace(old_line, "")
     new_content = _update_serial_in_content(new_content, new_serial)
 
-    _commit_edit(zone_name, backup, new_content, device_id=device_id)
+    await _commit_edit(zone_name, backup, new_content, device_id=device_id)
 
     # Audit
     db.add(AuditLog(
@@ -333,7 +333,7 @@ def _update_serial_in_content(content: str, new_serial: str) -> str:
 async def _refresh_record_count(db: AsyncSession, zone: Zone, zone_name: str):
     """Re-parse the zone file and update record_count in DB."""
     try:
-        content = ssh_connector.read_zone(zone_name, device_id=zone.device_id)
+        content = await run_ssh(ssh_connector.read_zone,zone_name, device_id=zone.device_id)
         parsed = parse_zone_text(content, zone_name)
         records = extract_records(parsed, zone_name)
         zone.record_count = len(records)

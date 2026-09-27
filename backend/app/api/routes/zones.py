@@ -14,7 +14,7 @@ from app.schemas import (
 )
 from app.core.auth import get_current_user, require_permission
 from app.core.rbac import has_permission, has_permission_for_zone
-from app.services.ssh_connector import ssh_connector
+from app.services.ssh_connector import ssh_connector, run_ssh
 from app.services.zone_parser import (
     parse_zone_text, extract_records, get_zone_serial,
     validate_zone_syntax, generate_zone_template, increment_serial,
@@ -70,7 +70,7 @@ async def sync_zones_from_devices(
         )
 
         try:
-            zones_on_f5 = ssh_connector.discover_zones(device_id=device.id)
+            zones_on_f5 = await run_ssh(ssh_connector.discover_zones,device_id=device.id)
         except Exception as e:
             logger.error(f"Failed to discover zones on {device.group_name}: {e}")
             response.items.append(ZoneSyncItem(
@@ -86,7 +86,7 @@ async def sync_zones_from_devices(
             # Determine record count from zone content
             record_count = 0
             try:
-                content = ssh_connector.read_zone(zone_name, device_id=device.id)
+                content = await run_ssh(ssh_connector.read_zone,zone_name, device_id=device.id)
                 zone_obj = parse_zone_text(content, zone_name)
                 records = extract_records(zone_obj, zone_name)
                 record_count = len(records)
@@ -174,18 +174,11 @@ async def list_zones(
     result = await db.execute(query)
     zones = result.scalars().all()
 
-    # Refresh record_count from F5 for each zone (real-time, not cached)
-    for z in zones:
-        try:
-            content = ssh_connector.read_zone(z.zone_name, device_id=z.device_id)
-            parsed = parse_zone_text(content, z.zone_name)
-            records = extract_records(parsed, z.zone_name)
-            live_count = len(records)
-            if z.record_count != live_count:
-                z.record_count = live_count
-        except Exception as e:
-            logger.debug(f"Could not refresh record_count for {z.zone_name}: {e}")
-    await db.flush()
+    # NOTE: record_count is served from the DB. Do NOT refresh from F5
+    # here — a blocking SSH read per zone (15-45s each when the device
+    # is unreachable) stalls the event loop and makes this endpoint
+    # exceed the frontend's 30s axios timeout. Counts are refreshed by
+    # record/zone CRUD operations and the sync endpoint instead.
 
     return ZoneListResponse(
         items=[ZoneResponse.model_validate(z) for z in zones],
@@ -227,7 +220,7 @@ async def get_raw_zone(
     zone = result.scalar_one_or_none()
 
     try:
-        content = ssh_connector.read_zone(zone_name, device_id=zone.device_id if zone else None)
+        content = await run_ssh(ssh_connector.read_zone,zone_name, device_id=zone.device_id if zone else None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SSH read failed: {e}")
 
@@ -260,7 +253,7 @@ async def update_raw_zone(
     backup = None
     try:
         # Step 1: sync journal & backup (begin_zone_edit handles this)
-        content, backup = ssh_connector.begin_zone_edit(zone_name, device_id=zone.device_id)
+        content, backup = await run_ssh(ssh_connector.begin_zone_edit,zone_name, device_id=zone.device_id)
 
         # Save backup to DB
         try:
@@ -271,12 +264,12 @@ async def update_raw_zone(
             logger.warning(f"Failed to save backup record: {e}")
 
         # Step 2: write new content & reload
-        exit_code, out, err = ssh_connector.end_zone_edit(zone_name, body.content, device_id=zone.device_id)
+        exit_code, out, err = await run_ssh(ssh_connector.end_zone_edit,zone_name, body.content, device_id=zone.device_id)
         if exit_code != 0:
             raise Exception(f"rndc reload failed: {err}")
 
         # Step 3: verify
-        soa = ssh_connector.dig_query(f"{zone_name} SOA", device_id=zone.device_id)
+        soa = await run_ssh(ssh_connector.dig_query,f"{zone_name} SOA", device_id=zone.device_id)
         if not soa:
             raise Exception("Zone reload verification failed — no SOA returned")
 
@@ -284,7 +277,7 @@ async def update_raw_zone(
         # Rollback on failure
         if backup:
             try:
-                ssh_connector.rollback_zone_edit(zone_name, backup, device_id=zone.device_id)
+                await run_ssh(ssh_connector.rollback_zone_edit,zone_name, backup, device_id=zone.device_id)
             except Exception as rollback_err:
                 logger.error(f"Rollback failed: {rollback_err}")
 
@@ -337,7 +330,7 @@ async def create_zone(
 
     try:
         # Create zone on F5 device (includes syntax check + reload + dig verification)
-        ssh_connector.create_zone(body.zone_name, content, device_id=body.device_id)
+        await run_ssh(ssh_connector.create_zone,body.zone_name, content, device_id=body.device_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -391,10 +384,10 @@ async def delete_zone(
         raise HTTPException(status_code=404, detail="Zone not found")
 
     try:
-        ssh_connector.delete_zone(zone_name, device_id=zone.device_id)
+        await run_ssh(ssh_connector.delete_zone,zone_name, device_id=zone.device_id)
 
         # Verify deletion
-        verify_result = ssh_connector.dig_query(f"{zone_name} SOA", device_id=zone.device_id)
+        verify_result = await run_ssh(ssh_connector.dig_query, f"{zone_name} SOA", device_id=zone.device_id)
         if verify_result:
             raise HTTPException(status_code=500, detail="Zone deletion verification failed — zone still resolving")
 

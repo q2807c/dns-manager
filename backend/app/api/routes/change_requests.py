@@ -16,7 +16,7 @@ from app.schemas import (
 )
 from app.core.auth import get_current_user, require_permission
 from app.core.rbac import has_permission
-from app.services.ssh_connector import ssh_connector
+from app.services.ssh_connector import ssh_connector, run_ssh
 from app.services.zone_parser import (
     parse_zone_text, extract_records, get_zone_serial,
     validate_zone_syntax, increment_serial,
@@ -68,7 +68,7 @@ async def _get_zone_device_id(db, zone_name: str) -> Optional[int]:
 async def _execute_record_create(zone_name: str, payload: dict, db, user: User):
     """Execute a record creation on F5."""
     device_id = await _get_zone_device_id(db, zone_name)
-    content, backup = ssh_connector.begin_zone_edit(zone_name, device_id=device_id)
+    content, backup = await run_ssh(ssh_connector.begin_zone_edit,zone_name, device_id=device_id)
     current_serial = get_zone_serial(content)
 
     # Save backup to DB
@@ -92,9 +92,9 @@ async def _execute_record_create(zone_name: str, payload: dict, db, user: User):
     if not is_valid:
         raise ValueError(f"Invalid zone after change: {'; '.join(errors)}")
 
-    exit_code, out, err = ssh_connector.end_zone_edit(zone_name, new_content, device_id=device_id)
+    exit_code, out, err = await run_ssh(ssh_connector.end_zone_edit,zone_name, new_content, device_id=device_id)
     if exit_code != 0:
-        ssh_connector.rollback_zone_edit(zone_name, backup, device_id=device_id)
+        await run_ssh(ssh_connector.rollback_zone_edit,zone_name, backup, device_id=device_id)
         raise Exception(f"rndc reload failed: {err}")
 
     # Update zone metadata
@@ -123,7 +123,7 @@ async def _execute_record_modify(zone_name: str, payload: dict, db, user: User):
     from app.schemas import DNSRecordCreate
 
     device_id = await _get_zone_device_id(db, zone_name)
-    content, backup = ssh_connector.begin_zone_edit(zone_name, device_id=device_id)
+    content, backup = await run_ssh(ssh_connector.begin_zone_edit,zone_name, device_id=device_id)
     current_serial = get_zone_serial(content)
 
     # Save backup to DB
@@ -157,9 +157,9 @@ async def _execute_record_modify(zone_name: str, payload: dict, db, user: User):
     if not is_valid:
         raise ValueError(f"Invalid zone: {'; '.join(errors)}")
 
-    exit_code, out, err = ssh_connector.end_zone_edit(zone_name, new_content, device_id=device_id)
+    exit_code, out, err = await run_ssh(ssh_connector.end_zone_edit,zone_name, new_content, device_id=device_id)
     if exit_code != 0:
-        ssh_connector.rollback_zone_edit(zone_name, backup, device_id=device_id)
+        await run_ssh(ssh_connector.rollback_zone_edit,zone_name, backup, device_id=device_id)
         raise Exception(f"rndc reload failed: {err}")
 
     db.add(AuditLog(
@@ -186,7 +186,7 @@ async def _execute_record_delete(zone_name: str, payload: dict, db, user: User):
     from app.schemas import DNSRecordCreate
 
     device_id = await _get_zone_device_id(db, zone_name)
-    content, backup = ssh_connector.begin_zone_edit(zone_name, device_id=device_id)
+    content, backup = await run_ssh(ssh_connector.begin_zone_edit,zone_name, device_id=device_id)
     current_serial = get_zone_serial(content)
 
     # Save backup to DB
@@ -214,9 +214,9 @@ async def _execute_record_delete(zone_name: str, payload: dict, db, user: User):
     if not is_valid:
         raise ValueError(f"Invalid zone: {'; '.join(errors)}")
 
-    exit_code, out, err = ssh_connector.end_zone_edit(zone_name, new_content, device_id=device_id)
+    exit_code, out, err = await run_ssh(ssh_connector.end_zone_edit,zone_name, new_content, device_id=device_id)
     if exit_code != 0:
-        ssh_connector.rollback_zone_edit(zone_name, backup, device_id=device_id)
+        await run_ssh(ssh_connector.rollback_zone_edit,zone_name, backup, device_id=device_id)
         raise Exception(f"rndc reload failed: {err}")
 
     result = await db.execute(select(Zone).where(Zone.zone_name == zone_name))
@@ -246,9 +246,9 @@ async def _execute_zone_create(zone_name: str, payload: dict, db, user: User):
 
     content = generate_zone_template(zone_name, ttl, master, email, ns)
     device_id = payload.get("device_id")
-    ssh_connector.create_zone(zone_name, content, device_id=device_id)
+    await run_ssh(ssh_connector.create_zone,zone_name, content, device_id=device_id)
 
-    soa = ssh_connector.dig_query(f"{zone_name} SOA", device_id=device_id)
+    soa = await run_ssh(ssh_connector.dig_query,f"{zone_name} SOA", device_id=device_id)
     if not soa:
         raise Exception("Zone creation verification failed")
 
@@ -277,9 +277,9 @@ async def _execute_zone_delete(zone_name: str, db, user: User):
         raise ValueError("Zone not found")
 
     device_id = zone.device_id
-    ssh_connector.delete_zone(zone_name, device_id=device_id)
+    await run_ssh(ssh_connector.delete_zone,zone_name, device_id=device_id)
 
-    verify = ssh_connector.dig_query(f"{zone_name} SOA", device_id=device_id)
+    verify = await run_ssh(ssh_connector.dig_query,f"{zone_name} SOA", device_id=device_id)
     if verify:
         raise Exception("Zone deletion verification failed — zone still resolving")
 
@@ -303,7 +303,7 @@ async def _execute_raw_zone_edit(zone_name: str, payload: dict, db, user: User):
         raise ValueError(f"Invalid zone syntax: {'; '.join(errors)}")
 
     device_id = await _get_zone_device_id(db, zone_name)
-    content, backup = ssh_connector.begin_zone_edit(zone_name, device_id=device_id)
+    content, backup = await run_ssh(ssh_connector.begin_zone_edit,zone_name, device_id=device_id)
 
     # Save backup to DB
     try:
@@ -312,14 +312,14 @@ async def _execute_raw_zone_edit(zone_name: str, payload: dict, db, user: User):
     except Exception as e:
         logger.warning(f"Failed to save backup record: {e}")
 
-    exit_code, out, err = ssh_connector.end_zone_edit(zone_name, new_content, device_id=device_id)
+    exit_code, out, err = await run_ssh(ssh_connector.end_zone_edit,zone_name, new_content, device_id=device_id)
     if exit_code != 0:
-        ssh_connector.rollback_zone_edit(zone_name, backup, device_id=device_id)
+        await run_ssh(ssh_connector.rollback_zone_edit,zone_name, backup, device_id=device_id)
         raise Exception(f"rndc reload failed: {err}")
 
-    soa = ssh_connector.dig_query(f"{zone_name} SOA", device_id=device_id)
+    soa = await run_ssh(ssh_connector.dig_query,f"{zone_name} SOA", device_id=device_id)
     if not soa:
-        ssh_connector.rollback_zone_edit(zone_name, backup, device_id=device_id)
+        await run_ssh(ssh_connector.rollback_zone_edit,zone_name, backup, device_id=device_id)
         raise Exception("Zone reload verification failed")
 
     db.add(AuditLog(

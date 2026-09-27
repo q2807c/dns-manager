@@ -15,6 +15,9 @@ Multi-device support:
 - All SSH methods accept an optional device_id — if None, the first
   registered active device is used, falling back to settings.
 """
+import asyncio
+import concurrent.futures
+import functools
 import logging
 import re
 from datetime import datetime
@@ -24,6 +27,36 @@ import paramiko
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+# ── Non-blocking execution helper ──────────────────────────────────
+#
+# paramiko is fully blocking: a connect timeout can stall for up to
+# ~45s (connect 15s + banner 15s + auth 15s). Calling it directly from
+# async routes blocks the asyncio event loop and freezes EVERY endpoint
+# (observed: a device "test connection" stalled GET /api/users for 14s).
+#
+# A dedicated single-worker thread executor:
+#   * keeps the event loop free, and
+#   * serializes SSH work, which also protects the shared
+#     SSHClient cache in SSHConnector from concurrent access.
+
+_ssh_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="ssh-worker",
+)
+
+
+async def run_ssh(fn, *args, **kwargs):
+    """Run a blocking ssh_connector call in the SSH worker thread.
+
+    Usage (inside async route handlers / helpers):
+        exit_code, out, err = await run_ssh(
+            ssh_connector.exec_command, "hostname", device_id=1)
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _ssh_executor, functools.partial(fn, **kwargs), *args,
+    )
 
 
 # ── Default config (from settings) ─────────────────────────────────
