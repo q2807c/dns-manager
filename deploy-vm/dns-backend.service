@@ -1,0 +1,16 @@
+[Unit]
+Description=DNS Zone Manager Backend (FastAPI + uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/dns-manager/backend
+EnvironmentFile=/home/ubuntu/dns-manager/.env
+ExecStartPre=/home/ubuntu/dns-manager/backend/venv/bin/python /home/ubuntu/dns-manager/backend/init_db.py
+ExecStart=/home/ubuntu/dns-manager/backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
