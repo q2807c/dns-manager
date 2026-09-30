@@ -98,15 +98,31 @@ async def sync_zones_from_devices(
                 existing_zone = (await db.execute(
                     select(Zone).where(Zone.zone_name == zone_name)
                 )).scalar_one_or_none()
-                if existing_zone and existing_zone.record_count != record_count:
-                    existing_zone.record_count = record_count
-                    response.items.append(ZoneSyncItem(
-                        zone_name=zone_name,
-                        device_group=device.group_name,
-                        status="updated",
-                        detail=f"record_count {existing_zone.record_count} → {record_count}",
-                    ))
-                    response.updated += 1
+                if existing_zone is not None:
+                    previous_count = existing_zone.record_count
+                    # A zone that still exists on the device but is
+                    # soft-deleted locally has to come back: delete only sets
+                    # is_active=False, so it would otherwise stay invisible
+                    # while its records are still served by the device.
+                    if not existing_zone.is_active:
+                        existing_zone.is_active = True
+                        existing_zone.record_count = record_count
+                        response.items.append(ZoneSyncItem(
+                            zone_name=zone_name,
+                            device_group=device.group_name,
+                            status="updated",
+                            detail="设备上存在，已恢复为可用",
+                        ))
+                        response.updated += 1
+                    elif previous_count != record_count:
+                        existing_zone.record_count = record_count
+                        response.items.append(ZoneSyncItem(
+                            zone_name=zone_name,
+                            device_group=device.group_name,
+                            status="updated",
+                            detail=f"record_count {previous_count} → {record_count}",
+                        ))
+                        response.updated += 1
                 response.already_exists += 1
                 continue
 
@@ -151,7 +167,10 @@ async def list_zones(
     db: AsyncSession = Depends(get_db),
 ):
     """List all accessible zones with pagination."""
-    query = select(Zone)
+    # Soft-deleted zones (is_active=False) must not be listed: delete only
+    # flips the flag, so without this filter a removed zone stays visible in
+    # the UI forever.
+    query = select(Zone).where(Zone.is_active == True)
 
     # super_admin sees all; others see assigned zones
     if user.role != "super_admin":
@@ -316,6 +335,18 @@ async def create_zone(
                 detail=f"主服务器 '{body.master_server}' 属于该 Zone 内部，必须提供主服务器 IP 地址（A 记录）",
             )
 
+    # Reject duplicates BEFORE touching the device. Zones are soft-deleted
+    # (is_active=False), so a plain INSERT collides on the UNIQUE zone_name —
+    # which used to surface as a bare 500 *after* the F5 had already been
+    # changed, leaving the device and the database out of sync.
+    existing = (await db.execute(
+        select(Zone).where(Zone.zone_name == body.zone_name)
+    )).scalar_one_or_none()
+    if existing and existing.is_active:
+        raise HTTPException(
+            status_code=409, detail=f"Zone {body.zone_name} 已存在",
+        )
+
     # Generate zone file content
     content = generate_zone_template(
         zone_name=body.zone_name,
@@ -341,18 +372,18 @@ async def create_zone(
     zone_records = extract_records(zone_parsed, body.zone_name)
     record_count = len(zone_records)
 
-    # Save to database
-    zone_obj = Zone(
-        zone_name=body.zone_name,
-        zone_type="master",
-        view_name=body.view_name,
-        file_name=f"db.external.{body.zone_name}",
-        record_count=record_count,
-        last_serial=increment_serial(None),
-        last_modified_by=user.id,
-        device_id=body.device_id,
-    )
-    db.add(zone_obj)
+    # Save to database (reactivate a previously soft-deleted row if present)
+    zone_obj = existing or Zone(zone_name=body.zone_name)
+    zone_obj.zone_type = "master"
+    zone_obj.view_name = body.view_name
+    zone_obj.file_name = f"db.external.{body.zone_name}"
+    zone_obj.record_count = record_count
+    zone_obj.last_serial = increment_serial(None)
+    zone_obj.last_modified_by = user.id
+    zone_obj.device_id = body.device_id
+    zone_obj.is_active = True
+    if existing is None:
+        db.add(zone_obj)
     await db.commit()
     await db.refresh(zone_obj)
 

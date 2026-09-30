@@ -66,6 +66,100 @@ async def run_ssh(fn, *args, **kwargs):
     )
 
 
+# ── named.conf zone-stanza surgery ─────────────────────────────────
+#
+# named.conf is edited as text, and the obvious regex for removing a stanza
+#
+#     r'\n\s*zone\s+"name\."\s*\{[^}]*\};'
+#
+# is wrong: `[^}]*` stops at the FIRST '}', which is the closing brace of the
+# nested `allow-update { ... };` block, so the zone's own trailing '};' is left
+# behind as an orphan. One orphaned brace is enough to make named.conf
+# syntactically invalid (`named-checkconf: syntax error near '}'`) — and because
+# named keeps answering from its in-memory copy, nothing looks broken until the
+# next reload or restart, long after the file was written. This happened in
+# production: deleting a zone silently corrupted the device's named.conf.
+#
+# These helpers walk braces instead of trusting a regex, and every writer below
+# validates the result (named-checkconf) and rolls back on failure.
+
+
+def find_zone_stanza(text: str, zone_name: str) -> Optional[Tuple[int, int]]:
+    """Return the (start, end) span of the `zone "<name>." { ... };` stanza.
+
+    Brace-aware: walks to the brace that actually closes the stanza, so nested
+    blocks (`allow-update { ... };`) do not cut the match short. Returns None
+    when the stanza is absent or the braces are unbalanced.
+    """
+    match = re.search(
+        rf'^[ \t]*zone\s+"{re.escape(zone_name)}\."\s*\{{', text, re.MULTILINE,
+    )
+    if not match:
+        return None
+    open_brace = match.end() - 1  # the pattern ends on the '{'
+    depth = 0
+    for i in range(open_brace, len(text)):
+        char = text[i]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                semicolon = text.find(";", i)
+                if semicolon == -1:
+                    return None
+                end = semicolon + 1
+                while end < len(text) and text[end] in " \t":
+                    end += 1
+                if end < len(text) and text[end] == "\n":
+                    end += 1
+                start = match.start()
+                # Swallow the single blank line that insert_zone_stanza() puts
+                # before a stanza, so create → delete round-trips byte-for-byte
+                # instead of accumulating blank lines pass after pass.
+                if start > 0 and text[start - 1] == "\n":
+                    prev_line_end = start - 1
+                    prev_line_start = text.rfind("\n", 0, prev_line_end) + 1
+                    if not text[prev_line_start:prev_line_end].strip():
+                        start = prev_line_start
+                return start, end
+    return None  # unbalanced — never guess
+
+
+def remove_zone_stanza(text: str, zone_name: str) -> str:
+    """Remove a zone stanza from named.conf. Returns *text* unchanged if absent."""
+    span = find_zone_stanza(text, zone_name)
+    if span is None:
+        return text
+    return text[:span[0]] + text[span[1]:]
+
+
+def insert_zone_stanza(text: str, stanza: str) -> str:
+    """Insert *stanza* as the last entry of `view "external"`."""
+    stripped = text.rstrip()
+    if not stripped.endswith("};"):
+        raise RuntimeError(
+            "named.conf does not end with the view's closing '};' — refusing to edit",
+        )
+    # F5 writes named.conf without a trailing newline; keep whatever the file
+    # had so create → delete restores it byte-for-byte.
+    tail = "\n" if text.endswith("\n") else ""
+    return stripped[:-2].rstrip("\n") + "\n" + stanza + "};" + tail
+
+
+def named_conf_braces_balanced(text: str) -> bool:
+    """Structural sanity check for named.conf (used by the file-backed connector)."""
+    depth = 0
+    for char in text:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
 # ── Default config (from settings) ─────────────────────────────────
 
 def _default_device_config() -> Dict[str, Any]:
@@ -390,8 +484,11 @@ class SSHConnector:
             raise RuntimeError(f"Zone syntax check failed for {zone_name}: {msg}")
 
         # Add zone stanza to named.conf
-        self.backup_named_conf(device_id=device_id)
+        backup_file = self.backup_named_conf(device_id=device_id)
         named_conf = self.read_file(named_conf_path, device_id=device_id)
+        if 'view "external"' not in named_conf:
+            self.exec_command(f"rm -f {zone_file}", device_id=device_id)
+            raise RuntimeError('named.conf 中找不到 view "external"，已中止（未改动设备）')
         stanza = (
             f'\n    zone "{zone_name}." {{\n'
             f'        type master;\n'
@@ -401,11 +498,15 @@ class SSHConnector:
             f'        }};\n'
             f'    }};\n'
         )
-        if 'view "external"' in named_conf:
-            named_conf = named_conf.rstrip()
-            if named_conf.endswith('};'):
-                named_conf = named_conf[:-2] + stanza + '};'
-        self.write_file(named_conf_path, named_conf, device_id=device_id)
+        try:
+            self._write_named_conf_checked(
+                insert_zone_stanza(named_conf, stanza), backup_file,
+                device_id=device_id,
+            )
+        except Exception:
+            # named.conf was rolled back — do not leave the new zone file behind
+            self.exec_command(f"rm -f {zone_file}", device_id=device_id)
+            raise
 
         self.reconfig_named(device_id=device_id)
 
@@ -417,16 +518,24 @@ class SSHConnector:
         raise RuntimeError(f"Zone {zone_name} created but SOA not resolving after reload")
 
     def delete_zone(self, zone_name: str, device_id: Optional[int] = None):
-        """Delete a zone file and remove from named.conf."""
+        """Delete a zone file and remove its stanza from named.conf."""
         named_conf_path = self._named_conf_path(device_id)
         zone_file = self._zone_file_path(zone_name, device_id)
 
-        self.backup_named_conf(device_id=device_id)
+        backup_file = self.backup_named_conf(device_id=device_id)
         named_conf = self.read_file(named_conf_path, device_id=device_id)
-        pattern = rf'\n\s*zone\s+"{re.escape(zone_name)}\."\s*\{{[^}}]*\}};'
-        named_conf = re.sub(pattern, '', named_conf, flags=re.DOTALL)
-        self.write_file(named_conf_path, named_conf, device_id=device_id)
-        self.reconfig_named(device_id=device_id)
+        updated = remove_zone_stanza(named_conf, zone_name)
+
+        if updated == named_conf:
+            # Previously this fell through to a silent no-op + reload, which hid
+            # the fact that nothing was deleted (and masked a half-applied edit).
+            logger.warning(
+                'delete_zone(%s): named.conf has no matching zone stanza; '
+                'removing the zone file only', zone_name,
+            )
+        else:
+            self._write_named_conf_checked(updated, backup_file, device_id=device_id)
+            self.reconfig_named(device_id=device_id)
 
         self.exec_command(f"rm -f {zone_file}", device_id=device_id)
         self.exec_command(f"rm -f {zone_file}.jnl", device_id=device_id)
@@ -452,6 +561,47 @@ class SSHConnector:
             f"named-checkzone {zone_name} {zone_file}", device_id=device_id,
         )
         return exit_code == 0, stdout + "\n" + stderr
+
+    def named_checkconf(self, device_id: Optional[int] = None) -> Tuple[bool, str]:
+        """Validate named.conf on the device with named-checkconf.
+
+        BIG-IP runs named chrooted under /var/named, so the check needs -t plus
+        a chroot-relative path; without -t, checkconf cannot resolve
+        `directory "/config/namedb"` and reports a false failure.
+
+        Returns (is_valid, message).
+        """
+        named_conf = self._named_conf_path(device_id)
+        target = named_conf
+        if named_conf.startswith("/var/named/"):
+            target = f"-t /var/named {named_conf[len('/var/named'):]}"
+        exit_code, stdout, stderr = self.exec_command(
+            f"/usr/sbin/named-checkconf {target} 2>&1", device_id=device_id,
+        )
+        return exit_code == 0, (stdout + stderr).strip()
+
+    def _write_named_conf_checked(
+        self, new_content: str, backup_file: str, device_id: Optional[int] = None,
+    ):
+        """Write named.conf, validate it, and roll back if it is broken.
+
+        Nothing else notices a corrupt named.conf: named keeps serving from its
+        in-memory copy, so the damage stays invisible until the next reload or
+        restart — exactly how a bad edit once survived unnoticed on a live
+        device. Refusing to leave an unloadable file behind is the only safe
+        behaviour.
+        """
+        named_conf_path = self._named_conf_path(device_id)
+        self.write_file(named_conf_path, new_content, device_id=device_id)
+        ok, message = self.named_checkconf(device_id=device_id)
+        if not ok:
+            self.exec_command(
+                f"cp {backup_file} {named_conf_path}", device_id=device_id,
+            )
+            logger.error("named.conf validation failed, rolled back: %s", message)
+            raise RuntimeError(
+                f"named.conf 校验失败，已回滚（未对设备生效）: {message}",
+            )
 
 
 # ── Offline demo mode ──────────────────────────────────────────────
@@ -684,6 +834,30 @@ class DemoConnector:
         ok, errors = validate_zone_syntax(content)
         return ok, "zone loaded: ok" if ok else "; ".join(errors)
 
+    def named_checkconf(self, device_id: Optional[int] = None) -> Tuple[bool, str]:
+        """Structural check of the local named.conf copy (demo stand-in for
+        named-checkconf). Mirrors the device-side guard so the demo instance
+        cannot drift into a state the real one would reject."""
+        try:
+            text = self.named_conf.read_text()
+        except FileNotFoundError:
+            return False, "[demo] named.conf not found"
+        if named_conf_braces_balanced(text):
+            return True, ""
+        return False, "[demo] named.conf 花括号不平衡"
+
+    def _write_named_conf_checked(
+        self, new_content: str, backup_file: str, device_id: Optional[int] = None,
+    ):
+        self.named_conf.write_text(new_content)
+        ok, message = self.named_checkconf(device_id=device_id)
+        if not ok:
+            shutil.copy2(backup_file, self.named_conf)
+            logger.error("named.conf validation failed, rolled back: %s", message)
+            raise RuntimeError(
+                f"named.conf 校验失败，已回滚（未生效）: {message}",
+            )
+
     # ── Zone CRUD ──────────────────────────────────────────────────
 
     def create_zone(self, zone_name: str, content: str, device_id: Optional[int] = None):
@@ -706,25 +880,36 @@ class DemoConnector:
             f'        }};\n'
             f'    }};\n'
         )
-        if 'view "external"' in named_conf:
-            named_conf = named_conf.rstrip()
-            if named_conf.endswith('};'):
-                named_conf = named_conf[:-2] + stanza + '};'
-        self.write_file(self._named_conf_path(device_id), named_conf, device_id=device_id)
+        if 'view "external"' not in named_conf:
+            self._local_path(zone_file).unlink(missing_ok=True)
+            raise RuntimeError('named.conf 中找不到 view "external"，已中止（未改动）')
+        try:
+            self._write_named_conf_checked(
+                insert_zone_stanza(named_conf, stanza),
+                f"{self.named_conf}.bak", device_id=device_id,
+            )
+        except Exception:
+            self._local_path(zone_file).unlink(missing_ok=True)
+            raise
 
         if not self.dig_query(f"{zone_name} SOA", device_id=device_id):
             raise RuntimeError(f"Zone {zone_name} created but SOA not resolving after reload")
 
     def delete_zone(self, zone_name: str, device_id: Optional[int] = None):
+        """Delete a zone file and remove its stanza from named.conf."""
+        zone_file = self._zone_file_path(zone_name, device_id)
         self.backup_named_conf(device_id=device_id)
         named_conf = self.read_file(self._named_conf_path(device_id), device_id=device_id)
-        pattern = rf'\n\s*zone\s+"{re.escape(zone_name)}\."\s*\{{[^}}]*\}};'
-        self.write_file(
-            self._named_conf_path(device_id),
-            re.sub(pattern, "", named_conf, flags=re.DOTALL),
-            device_id=device_id,
-        )
-        self.reconfig_named(device_id=device_id)
+        updated = remove_zone_stanza(named_conf, zone_name)
+        if updated == named_conf:
+            logger.warning(
+                'delete_zone(%s): named.conf has no matching zone stanza; '
+                'removing the zone file only', zone_name,
+            )
+        else:
+            self._write_named_conf_checked(
+                updated, f"{self.named_conf}.bak", device_id=device_id,
+            )
         for path in (
             self._zone_file_path(zone_name, device_id),
             self._zone_file_path(zone_name, device_id) + ".jnl",

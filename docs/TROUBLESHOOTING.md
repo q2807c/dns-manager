@@ -17,6 +17,7 @@
 - [G. 性能 / 资源](#g-性能--资源)
 - [H. 备份 / 恢复](#h-备份--恢复)
 - [I. 日志线索速查](#i-日志线索速查)
+- [J. named.conf 安全与数据一致性](#j-namedconf-安全与数据一致性)
 
 ---
 
@@ -479,6 +480,75 @@ docker compose -f docker-compose.lite.yml exec -T backend \
 ```bash
 docker compose -f docker-compose.lite.yml logs backend --tail=1000 | \
   grep -A 30 "Traceback"
+```
+
+---
+
+## J. named.conf 安全与数据一致性
+
+### J.1 删除 zone 后设备 named.conf 出现语法错误（已修复）
+
+**症状**
+
+- `named-checkconf` 报 `syntax error near '}'`
+- 删除 zone 的请求看起来成功或失败，但之后 named 重载/重启不生效
+- **最迷惑的地方：DNS 往往还在正常解析** —— named 用内存里的旧配置继续服务，坏文件会潜伏到下一次 `rndc reconfig` / 重启才爆发
+
+**根因（1.0.0 及更早版本）**
+
+- `delete_zone` 用正则 `zone "x." {[^}]*};` 匹配要删的 stanza。`[^}]*` 遇到**第一个** `}` 就停 ——
+  那是内层 `allow-update { ... };` 的收尾，于是 zone 自己的 `};` 变成孤儿留在文件里
+- `create_zone` / `delete_zone` 写完 named.conf 后不做校验，坏文件就此留在设备上
+
+**检测**
+
+```bash
+# F5 上执行（named 运行在 chroot /var/named，必须带 -t 和 chroot 内路径）
+named-checkconf -t /var/named /config/named.conf; echo rc=$?
+#   rc=0 且无输出 = 正常；有 "syntax error" = 配置已损坏
+
+# 花括号粗查（数量必须相等）
+grep -c '};' /var/named/config/named.conf; grep -c '{' /var/named/config/named.conf
+```
+
+**处置**
+
+```bash
+# 1) 先留证
+cp -p /var/named/config/named.conf /var/tmp/named.conf.corrupt-$(date +%Y%m%d-%H%M%S)
+
+# 2) 用平台自动备份回滚（每次写操作前的备份）
+cp /var/named/config/named.conf.bak /var/named/config/named.conf
+#    或手工删掉 view 收尾前多出来的那一行 "    };"
+
+# 3) 校验 + 重载
+named-checkconf -t /var/named /config/named.conf && rndc reconfig
+chown named:named /var/named/config/named.conf && chmod 600 /var/named/config/named.conf
+```
+
+**修复后的行为**
+
+- stanza 增删改为花括号配对扫描，不再依赖正则
+- 每次写 named.conf 后自动执行 `named-checkconf`；失败立即从 `.bak` 回滚并报错，坏文件不会留在设备上
+- 新建 → 删除 往返**逐字节一致**，反复操作不会累积空行或孤儿
+
+> ⚠️ F5 的 `/var/named/config/named.conf` 是由 TMOS 配置生成的。平台直接改文件属于带外操作，
+> 设备重新加载自身配置时可能覆盖。对长期存在的 zone，建议同时在 tmsh 侧维护。
+
+### J.2 删除过的 zone 无法重建 / 删除后仍显示在列表里（已修复）
+
+- 删除是**软删除**（`is_active=False`，行保留）。修复前：重建同名 zone 触发 `UNIQUE constraint failed: zones.zone_name` → 500；
+  且软删除的 zone 依旧出现在 Zone 列表中
+- 现已修复：创建前先查重（已存在返回 409；命中软删除行则复用并重新激活），列表只返回 `is_active` 的 zone
+
+### J.3 zone 与设备不一致
+
+- 用界面「Zone 同步」重新从设备 named.conf 拉取；设备上仍存在的 zone 会自动恢复为可用
+- 手工核对：
+
+```bash
+grep 'zone "' /var/named/config/named.conf      # 设备侧实际 zone
+ls /var/named/config/namedb/db.external.*       # 实际 zone 文件
 ```
 
 ---

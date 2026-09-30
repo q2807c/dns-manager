@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] - 2026-09-30
+
+### 🐛 严重修复
+
+- **删除 zone 会损坏设备上的 named.conf**（会导致 DNS 在下次重载/重启后失效）
+  - 根因：`delete_zone` 的正则 `zone "x." {[^}]*};` 在**第一个** `}` 处停止匹配，那其实是内层
+    `allow-update { ... };` 的收尾，于是 zone 自身的 `};` 被留成孤儿，文件花括号失衡
+  - 危险点：named 仍用内存里的旧配置服务，**表面一切正常**，直到下次 `rndc reconfig` / 重启才暴露
+  - 修复：stanza 增删改为**花括号配对扫描**（`find_zone_stanza` / `remove_zone_stanza` / `insert_zone_stanza`），
+    建 → 删往返逐字节一致，反复操作不累积空行
+- **写 named.conf 增加强制校验与自动回滚**
+  - 每次写入后执行 `named-checkconf -t /var/named`（chroot 感知）；校验失败立即从 `.bak` 回滚并抛错，
+    坏文件不会被留在设备上
+  - 文件后端的演示模式同步实现等价的结构校验与回滚
+
+### 🐛 其他修复
+
+- **删除过的 zone 无法重建**：删除为软删除（`is_active=False`，行保留），重建同名 zone 会触发
+  `UNIQUE constraint failed: zones.zone_name`，并以 500 返回——且失败发生在**设备已被修改之后**，
+  造成设备与数据库不一致。现在创建前先查重：已存在返回 **409**，命中软删除行则复用并重新激活
+- **软删除的 zone 仍出现在列表中**：`GET /api/zones` 现在只返回 `is_active` 的 zone
+- **Zone 同步补齐**：设备上仍存在但本地被软删除的 zone 会恢复为可用；`record_count` 变更提示修正为
+  变更前后的真实数值（原先打印的是赋值后的同一个值）
+
+### 📚 文档
+
+- `docs/TROUBLESHOOTING.md` 新增 **J. named.conf 安全与数据一致性**：损坏症状、检测命令、回滚步骤、
+  F5 由 TMOS 生成 named.conf 的注意事项
+
+---
+
 ## [1.0.0] - 2026-09-04
 
 ### 🎉 首个正式版本
