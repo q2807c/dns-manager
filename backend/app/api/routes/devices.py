@@ -263,9 +263,11 @@ async def test_device_connection(
         )
         ssh_connector.unregister_device(device.id)
         if exit_code == 0:
+            # stdout is "OK\n<hostname>"; keep the last non-empty line
+            lines = [ln for ln in stdout.strip().splitlines() if ln.strip()]
             return {
                 "status": "success",
-                "hostname": stdout.strip(),
+                "hostname": lines[-1] if lines else "",
                 "stderr": stderr.strip(),
             }
         # SSH connected but the command failed (non-zero exit or closed
