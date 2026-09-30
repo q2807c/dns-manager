@@ -253,8 +253,13 @@ async def test_device_connection(
         # Register temporarily and test (SSH work must run off the event
         # loop — a hanging connect otherwise stalls every other endpoint)
         ssh_connector.register_device(device.id, _device_config_from_model(device))
+        # NOTE: do NOT use `hostname` here — on BIG-IP the bare `hostname`
+        # binary is a wrapper that refuses to run from bash ("Use the TMOS
+        # shell utility to make changes to the system configuration...") and
+        # exits 1, which makes a perfectly healthy connection look broken.
+        # `uname -n` returns the same value and is not intercepted.
         exit_code, stdout, stderr = await run_ssh(
-            ssh_connector.exec_command, "echo OK && hostname", device_id=device.id,
+            ssh_connector.exec_command, "echo OK && uname -n", device_id=device.id,
         )
         ssh_connector.unregister_device(device.id)
         if exit_code == 0:
@@ -264,13 +269,19 @@ async def test_device_connection(
                 "stderr": stderr.strip(),
             }
         # SSH connected but the command failed (non-zero exit or closed
-        # channel returning -1, e.g. tmsh/restricted shell on F5).
+        # channel returning -1, e.g. restricted shell / missing permission).
         # Always include an `error` field so the UI shows a real message
         # instead of falling back to "未知错误".
+        hint = ""
+        if "TMOS shell utility" in stderr or "tmsh" in stderr.lower():
+            hint = "（该提示来自 BIG-IP 对个别命令的封装拦截；请用 uname -n 验证，或确认账号 shell 为 bash）"
+        elif exit_code == -1:
+            hint = "（SSH 通道被关闭且未返回退出码，通常为受限 shell 或命令被设备拒绝）"
         return {
             "status": "failed",
             "error": (
-                f"SSH 已连接，但命令执行失败（exit={exit_code}）: {stderr.strip() or '无 stderr 输出（常见于 F5 tmsh 受限 shell，请将设备账号 shell 设为 bash）'}"
+                f"SSH 已连接，但命令执行失败（exit={exit_code}）: "
+                f"{stderr.strip() or '无 stderr 输出'}{hint}"
             ),
             "hostname": stdout.strip(),
             "stderr": stderr.strip(),
