@@ -82,4 +82,5 @@ async def health_check():
         "version": "0.2.0",
         "f5_active_host": settings.F5_ACTIVE_HOST,
         "configured_devices": configured_count,
+        "demo_mode": settings.DEMO_MODE,
     }

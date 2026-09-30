@@ -20,11 +20,18 @@ import concurrent.futures
 import functools
 import logging
 import re
+import shutil
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import paramiko
 from app.config import settings
+from app.services.zone_parser import (
+    extract_records,
+    parse_zone_text,
+    validate_zone_syntax,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -279,7 +286,10 @@ class SSHConnector:
         all_files = self.list_dir(self._zone_dir(device_id), device_id=device_id)
         return sorted(
             f for f in all_files
-            if f.startswith("db.external.") and not f.endswith(".jnl") and ".bak." not in f
+            if f.startswith("db.external.")
+            and not f.endswith(".jnl")
+            and not f.endswith(".bak")
+            and ".bak." not in f
         )
 
     # ── Zone editing workflow ──────────────────────────────────────
@@ -444,5 +454,283 @@ class SSHConnector:
         return exit_code == 0, stdout + "\n" + stderr
 
 
-# Singleton instance
-ssh_connector = SSHConnector()
+# ── Offline demo mode ──────────────────────────────────────────────
+#
+# DEMO_MODE=true swaps the SSH-backed connector for this file-backed one:
+# the platform stays fully browsable and editable (zones, records, change
+# requests, backups, reloads) without any BIG-IP on site — which is what a
+# demo / POC instance needs when the real F5 is only reachable from
+# somewhere else.
+#
+# Everything is served from DEMO_DATA_DIR, mirroring the F5 layout:
+#
+#     DEMO_DATA_DIR/
+#         named.conf                    # zone list, same syntax as F5
+#         namedb/db.external.<zone>.    # zone files, same naming as F5
+#
+# To present real data, point DEMO_DATA_DIR at a copy of an exported F5
+# config (see docs/DEMO_MODE.md). Devices in the DB are ignored — the
+# "connection" always succeeds, so the device page keeps working.
+
+
+class DemoConnector:
+    """File-backed stand-in for :class:`SSHConnector` (DEMO_MODE only)."""
+
+    DEMO_HOSTNAME = "bigip-demo.f5.com"
+
+    def __init__(self):
+        self.root = Path(settings.DEMO_DATA_DIR).expanduser().resolve()
+        self.named_conf = self.root / "named.conf"
+        self.zone_dir = self.root / "namedb"
+        self.zone_dir.mkdir(parents=True, exist_ok=True)
+        self._devices: Dict[int, Dict[str, Any]] = {}
+        if not self.named_conf.exists():
+            self.named_conf.write_text('view "external" {\n};\n')
+        logger.warning(
+            "DEMO MODE is ON — all F5 operations are simulated from %s", self.root,
+        )
+
+    # ── Device registry (no SSH session is ever opened) ────────────
+
+    def register_device(self, device_id: int, config: Dict[str, Any]):
+        self._devices[device_id] = dict(config or {})
+        logger.info(f"Device {device_id} registered (demo mode)")
+
+    def is_registered(self, device_id: int) -> bool:
+        return device_id in self._devices
+
+    def unregister_device(self, device_id: int):
+        self._devices.pop(device_id, None)
+
+    def get_device_config(self, device_id: Optional[int] = None) -> Dict[str, Any]:
+        if device_id is not None and device_id in self._devices:
+            return self._devices[device_id]
+        if self._devices:
+            return next(iter(self._devices.values()))
+        return {"host": self.DEMO_HOSTNAME, "port": 22, "user": "root"}
+
+    def close(self, device_id: Optional[int] = None):
+        self._clients = {}
+
+    # ── Path mapping ───────────────────────────────────────────────
+
+    def _zone_dir(self, device_id: Optional[int] = None) -> str:
+        return str(self.zone_dir)
+
+    def _named_conf_path(self, device_id: Optional[int] = None) -> str:
+        return str(self.named_conf)
+
+    def _zone_file_path(self, zone_name: str, device_id: Optional[int] = None) -> str:
+        return str(self.zone_dir / f"db.external.{zone_name}.")
+
+    def _local_path(self, remote_path: str) -> Path:
+        """Map any F5 path onto its counterpart inside DEMO_DATA_DIR."""
+        name = Path(str(remote_path)).name
+        if name.startswith("named.conf"):
+            return self.root / name
+        return self.zone_dir / name
+
+    # ── File I/O ───────────────────────────────────────────────────
+
+    def read_file(self, remote_path: str, device_id: Optional[int] = None) -> str:
+        path = self._local_path(remote_path)
+        if not path.exists():
+            raise FileNotFoundError(f"[demo] no such file: {path.name}")
+        return path.read_text()
+
+    def write_file(self, remote_path: str, content: str, device_id: Optional[int] = None):
+        path = self._local_path(remote_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    def list_dir(self, remote_path: str, device_id: Optional[int] = None) -> List[str]:
+        return [p.name for p in self.zone_dir.iterdir()]
+
+    # ── Command execution (simulated) ──────────────────────────────
+
+    def exec_command(
+        self, command: str, timeout: int = 30, device_id: Optional[int] = None,
+    ) -> Tuple[int, str, str]:
+        cmd = command.strip()
+
+        if cmd.startswith("cp "):
+            parts = cmd.split()
+            if len(parts) >= 3:
+                shutil.copy2(self._local_path(parts[-2]), self._local_path(parts[-1]))
+            return 0, "", ""
+        if cmd.startswith("rm "):
+            for token in cmd.split()[1:]:
+                if not token.startswith("-"):
+                    self._local_path(token).unlink(missing_ok=True)
+            return 0, "", ""
+        if cmd.startswith("dig"):
+            return 0, self._dig(cmd), ""
+        if cmd.startswith("rndc"):
+            return 0, "zone reload up-to-date\n", ""
+        if cmd.startswith("named-checkzone"):
+            return 0, "zone loaded: ok\n", ""
+        if "hostname" in cmd or "uname -n" in cmd:
+            return 0, f"OK\n{self.DEMO_HOSTNAME}\n", ""
+        return 0, "", ""
+
+    # ── Zone discovery / reading ───────────────────────────────────
+
+    def _iter_zones(self):
+        """Yield (zone_name, content) for every real zone file."""
+        for path in sorted(self.zone_dir.iterdir()):
+            name = path.name
+            if (
+                not name.startswith("db.external.")
+                or name.endswith(".jnl")
+                or name.endswith(".bak")
+                or ".bak." in name
+            ):
+                continue
+            try:
+                yield name[len("db.external."):].rstrip("."), path.read_text()
+            except OSError:
+                continue
+
+    def discover_zones(self, device_id: Optional[int] = None) -> List[str]:
+        content = self.read_file(self._named_conf_path(device_id), device_id=device_id)
+        zones = re.findall(r'zone\s+"([^"]+)"\s*\{', content)
+        return [z.rstrip(".") for z in zones]
+
+    def list_zone_files(self, device_id: Optional[int] = None) -> List[str]:
+        return sorted(
+            p.name for p in self.zone_dir.iterdir()
+            if p.name.startswith("db.external.")
+            and not p.name.endswith(".jnl")
+            and not p.name.endswith(".bak")
+            and ".bak." not in p.name
+        )
+
+    def read_zone(self, zone_name: str, device_id: Optional[int] = None) -> str:
+        return self.read_file(self._zone_file_path(zone_name, device_id), device_id=device_id)
+
+    def sync_zone(self, zone_name: str, device_id: Optional[int] = None) -> Tuple[int, str, str]:
+        return 0, f"zone {zone_name} synced\n", ""
+
+    def reload_zone(self, zone_name: str, device_id: Optional[int] = None) -> Tuple[int, str, str]:
+        return 0, "zone reload up-to-date\n", ""
+
+    def reconfig_named(self, device_id: Optional[int] = None) -> Tuple[int, str, str]:
+        return 0, "reconfig done\n", ""
+
+    def dig_query(self, query: str, device_id: Optional[int] = None) -> str:
+        return self._dig(f"dig @127.0.0.1 {query} +short")
+
+    def _dig(self, cmd: str) -> str:
+        """Answer `<name> <type>` queries from the local zone files."""
+        tokens = [t for t in cmd.split() if not t.startswith("@") and not t.startswith("+")]
+        if len(tokens) < 3:
+            return ""
+        name, rtype = tokens[-2].rstrip("."), tokens[-1].upper()
+        for zone_name, content in self._iter_zones():
+            if not (name == zone_name or name.endswith("." + zone_name)):
+                continue
+            try:
+                zone = parse_zone_text(content, zone_name)
+                for record in extract_records(zone, zone_name):
+                    if record.type.upper() == rtype:
+                        return record.data + "\n"
+            except Exception:
+                continue
+        return ""
+
+    # ── Backup / edit workflows ────────────────────────────────────
+
+    def backup_zone_file(self, zone_name: str, device_id: Optional[int] = None) -> str:
+        zone_file = self._zone_file_path(zone_name, device_id)
+        backup_file = f"{zone_file}.bak"
+        self.exec_command(f"cp {zone_file} {backup_file}")
+        return backup_file
+
+    def backup_named_conf(self, device_id: Optional[int] = None) -> str:
+        backup_file = f"{self.named_conf}.bak"
+        shutil.copy2(self.named_conf, backup_file)
+        return backup_file
+
+    def begin_zone_edit(
+        self, zone_name: str, device_id: Optional[int] = None,
+    ) -> Tuple[str, str]:
+        self.sync_zone(zone_name, device_id=device_id)
+        backup_file = self.backup_zone_file(zone_name, device_id=device_id)
+        return self.read_zone(zone_name, device_id=device_id), backup_file
+
+    def end_zone_edit(
+        self, zone_name: str, new_content: str, device_id: Optional[int] = None,
+    ) -> Tuple[int, str, str]:
+        self.write_file(self._zone_file_path(zone_name, device_id), new_content, device_id=device_id)
+        return self.reload_zone(zone_name, device_id=device_id)
+
+    def rollback_zone_edit(
+        self, zone_name: str, backup_file: str, device_id: Optional[int] = None,
+    ):
+        self.exec_command(f"cp {backup_file} {self._zone_file_path(zone_name, device_id)}")
+        self.sync_zone(zone_name, device_id=device_id)
+        self.reload_zone(zone_name, device_id=device_id)
+        self.exec_command(f"rm -f {backup_file}")
+
+    # ── Validation ─────────────────────────────────────────────────
+
+    def named_checkzone(
+        self, zone_name: str, device_id: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        try:
+            content = self.read_zone(zone_name, device_id=device_id)
+        except FileNotFoundError:
+            return False, f"[demo] zone file not found for {zone_name}"
+        ok, errors = validate_zone_syntax(content)
+        return ok, "zone loaded: ok" if ok else "; ".join(errors)
+
+    # ── Zone CRUD ──────────────────────────────────────────────────
+
+    def create_zone(self, zone_name: str, content: str, device_id: Optional[int] = None):
+        zone_file = self._zone_file_path(zone_name, device_id)
+        self.write_file(zone_file, content, device_id=device_id)
+
+        ok, message = self.named_checkzone(zone_name, device_id=device_id)
+        if not ok:
+            self._local_path(zone_file).unlink(missing_ok=True)
+            raise RuntimeError(f"Zone syntax check failed for {zone_name}: {message}")
+
+        self.backup_named_conf(device_id=device_id)
+        named_conf = self.read_file(self._named_conf_path(device_id), device_id=device_id)
+        stanza = (
+            f'\n    zone "{zone_name}." {{\n'
+            f'        type master;\n'
+            f'        file "db.external.{zone_name}.";\n'
+            f'        allow-update {{\n'
+            f'            localhost;\n'
+            f'        }};\n'
+            f'    }};\n'
+        )
+        if 'view "external"' in named_conf:
+            named_conf = named_conf.rstrip()
+            if named_conf.endswith('};'):
+                named_conf = named_conf[:-2] + stanza + '};'
+        self.write_file(self._named_conf_path(device_id), named_conf, device_id=device_id)
+
+        if not self.dig_query(f"{zone_name} SOA", device_id=device_id):
+            raise RuntimeError(f"Zone {zone_name} created but SOA not resolving after reload")
+
+    def delete_zone(self, zone_name: str, device_id: Optional[int] = None):
+        self.backup_named_conf(device_id=device_id)
+        named_conf = self.read_file(self._named_conf_path(device_id), device_id=device_id)
+        pattern = rf'\n\s*zone\s+"{re.escape(zone_name)}\."\s*\{{[^}}]*\}};'
+        self.write_file(
+            self._named_conf_path(device_id),
+            re.sub(pattern, "", named_conf, flags=re.DOTALL),
+            device_id=device_id,
+        )
+        self.reconfig_named(device_id=device_id)
+        for path in (
+            self._zone_file_path(zone_name, device_id),
+            self._zone_file_path(zone_name, device_id) + ".jnl",
+        ):
+            self._local_path(path).unlink(missing_ok=True)
+
+
+# Singleton instance — file-backed when DEMO_MODE is on, SSH otherwise.
+ssh_connector = DemoConnector() if settings.DEMO_MODE else SSHConnector()

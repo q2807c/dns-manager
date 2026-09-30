@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     F5_NAMED_CONF: str = "/var/named/config/named.conf"
     F5_ZONE_DIR: str = "/var/named/config/namedb"
 
+    # Demo mode — serve fixed zone data from a local directory instead of
+    # opening SSH sessions to a real F5. Used for offline demos / POC
+    # presentations, where no BIG-IP is reachable from the host.
+    # DEMO_DATA_DIR must contain named.conf and namedb/db.external.<zone>.
+    DEMO_MODE: bool = False
+    DEMO_DATA_DIR: str = "./demo-data"
+
     # Celery
     CELERY_BROKER_URL: Optional[str] = None
 
