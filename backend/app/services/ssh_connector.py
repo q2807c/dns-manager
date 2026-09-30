@@ -91,6 +91,12 @@ class SSHConnector:
         self._devices[device_id] = config
         logger.info(f"Device {device_id} ({config.get('host')}) registered")
 
+    def is_registered(self, device_id: int) -> bool:
+        """Whether this device is currently registered (i.e. loaded from DB
+        at startup or via register_device) — callers must not unregister a
+        device they did not register themselves."""
+        return device_id in self._devices
+
     def unregister_device(self, device_id: int):
         """Remove a device and close its connection."""
         self._devices.pop(device_id, None)

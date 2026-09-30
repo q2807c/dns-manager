@@ -249,10 +249,15 @@ async def test_device_connection(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
+    # Register temporarily to test (SSH work must run off the event loop — a
+    # hanging connect otherwise stalls every other endpoint). If the device was
+    # already registered at startup from the DB, keep it registered afterwards:
+    # dropping it here used to wipe the credentials every other endpoint relies
+    # on, so they failed with "No authentication methods available" until the
+    # next restart.
+    was_registered = ssh_connector.is_registered(device.id)
+    ssh_connector.register_device(device.id, _device_config_from_model(device))
     try:
-        # Register temporarily and test (SSH work must run off the event
-        # loop — a hanging connect otherwise stalls every other endpoint)
-        ssh_connector.register_device(device.id, _device_config_from_model(device))
         # NOTE: do NOT use `hostname` here — on BIG-IP the bare `hostname`
         # binary is a wrapper that refuses to run from bash ("Use the TMOS
         # shell utility to make changes to the system configuration...") and
@@ -261,33 +266,36 @@ async def test_device_connection(
         exit_code, stdout, stderr = await run_ssh(
             ssh_connector.exec_command, "echo OK && uname -n", device_id=device.id,
         )
+    except Exception as e:
+        if not was_registered:
+            ssh_connector.unregister_device(device.id)
+        return {"status": "failed", "error": str(e)}
+
+    if not was_registered:
         ssh_connector.unregister_device(device.id)
-        if exit_code == 0:
-            # stdout is "OK\n<hostname>"; keep the last non-empty line
-            lines = [ln for ln in stdout.strip().splitlines() if ln.strip()]
-            return {
-                "status": "success",
-                "hostname": lines[-1] if lines else "",
-                "stderr": stderr.strip(),
-            }
-        # SSH connected but the command failed (non-zero exit or closed
-        # channel returning -1, e.g. restricted shell / missing permission).
-        # Always include an `error` field so the UI shows a real message
-        # instead of falling back to "未知错误".
-        hint = ""
-        if "TMOS shell utility" in stderr or "tmsh" in stderr.lower():
-            hint = "（该提示来自 BIG-IP 对个别命令的封装拦截；请用 uname -n 验证，或确认账号 shell 为 bash）"
-        elif exit_code == -1:
-            hint = "（SSH 通道被关闭且未返回退出码，通常为受限 shell 或命令被设备拒绝）"
+
+    if exit_code == 0:
+        # stdout is "OK\n<hostname>"; keep the last non-empty line
+        lines = [ln for ln in stdout.strip().splitlines() if ln.strip()]
         return {
-            "status": "failed",
-            "error": (
-                f"SSH 已连接，但命令执行失败（exit={exit_code}）: "
-                f"{stderr.strip() or '无 stderr 输出'}{hint}"
-            ),
-            "hostname": stdout.strip(),
+            "status": "success",
+            "hostname": lines[-1] if lines else "",
             "stderr": stderr.strip(),
         }
-    except Exception as e:
-        ssh_connector.unregister_device(device.id)
-        return {"status": "failed", "error": str(e)}
+    # SSH connected but the command failed (non-zero exit or closed channel
+    # returning -1, e.g. restricted shell / missing permission). Always include
+    # an `error` field so the UI shows a real message instead of "未知错误".
+    hint = ""
+    if "TMOS shell utility" in stderr or "tmsh" in stderr.lower():
+        hint = "（该提示来自 BIG-IP 对个别命令的封装拦截；请用 uname -n 验证，或确认账号 shell 为 bash）"
+    elif exit_code == -1:
+        hint = "（SSH 通道被关闭且未返回退出码，通常为受限 shell 或命令被设备拒绝）"
+    return {
+        "status": "failed",
+        "error": (
+            f"SSH 已连接，但命令执行失败（exit={exit_code}）: "
+            f"{stderr.strip() or '无 stderr 输出'}{hint}"
+        ),
+        "hostname": stdout.strip(),
+        "stderr": stderr.strip(),
+    }
